@@ -184,20 +184,17 @@ class Summarizer:
                 )
                 return False
 
-            # 6. Сформировать текст для LLM (ТОЛЬКО новые)
+            # 6. Сформировать текст для LLM (ТОЛЬКО новые, сгруппированные по чатам)
             chat_titles = list({m.get("chat_title", "Unknown") for m in messages})
 
-            messages_text = ""
-            for i, msg in enumerate(new_msgs, 1):
-                chat_title = msg.get("chat_title", "?")
-                telegram_id = msg.get("telegram_id", "?")
-                content = msg.get("content", "")
-                messages_text += (
-                    f"[MSG {i} | ID: {telegram_id} | CHAT: {chat_title}]\n"
-                    f"{content}\n\n{'=' * 50}\n\n"
-                )
+            # Группируем новые сообщения по чатам
+            from collections import defaultdict
+            by_chat = defaultdict(list)
+            for msg in new_msgs:
+                chat_title = msg.get("chat_title", "Unknown")
+                by_chat[chat_title].append(msg)
 
-            # 7. LLM ТОЛЬКО для new
+            # 7. LLM ТОЛЬКО для new — один запрос на чат
             llm_summaries = {}
             summary = ""
 
@@ -221,40 +218,102 @@ class Summarizer:
                 }
                 detail = detail_map.get(fmt, "medium")
 
-                logger.info("Вызов GigaChat API для %d новых сообщений (detail: %s)", len(new_msgs), detail)
-
-                summary = self.llm_client.summarize(messages_text, detail=detail)
-                if summary is None:
-                    logger.error("Ошибка GigaChat: summarize вернул None")
-                    await self.client.send_message(
-                        settings.owner_chat_id,
-                        "❌ Ошибка вызова GigaChat."
+                # Отправляем запрос на каждый чат отдельно
+                for chat_title, chat_msgs in by_chat.items():
+                    logger.info(
+                        "Вызов GigaChat API для чата '%s' (%d сообщений, detail: %s)",
+                        chat_title, len(chat_msgs), detail
                     )
-                    return False
 
-                logger.info(
-                    "Суммаризация получена (%d символов)",
-                    len(summary),
-                )
+                    # Формируем текст для этого чата
+                    messages_text = ""
+                    for msg in chat_msgs:
+                        telegram_id = msg.get("telegram_id", "?")
+                        content = msg.get("content", "")
+                        messages_text += (
+                            f"[ID: {telegram_id}]\n"
+                            f"{content}\n\n{'=' * 50}\n\n"
+                        )
 
-                # Парсим per-message summaries
-                logger.info("Ответ LLM (%d символов):\n%s", len(summary), summary[:2000])
-                llm_summaries = self._parse_llm_summaries(summary, new_msgs)
+                    response = self.llm_client.summarize(messages_text, detail=detail)
+                    if response is None:
+                        logger.error("Ошибка GigaChat для чата '%s'", chat_title)
+                        continue
 
-                # Логируем сообщения без суммари
-                for msg in new_msgs:
-                    tid = msg["telegram_id"]
-                    if tid not in llm_summaries:
-                        logger.warning("Нет суммари для msg_id=%d: %s", tid, msg.get("content", "")[:100])
+                    logger.info(
+                        "Суммаризация для '%s' получена (%d символов)",
+                        chat_title, len(response),
+                    )
 
-                # 8. Сохранить суммари в БД и пометить как processed
+                    # Парсим per-message summaries
+                    chat_summaries = self._parse_llm_summaries(response, chat_msgs)
+                    llm_summaries.update(chat_summaries)
+
+                    # Логируем сообщения без суммари
+                    for msg in chat_msgs:
+                        tid = msg["telegram_id"]
+                        if tid not in chat_summaries:
+                            logger.warning(
+                                "Нет суммари для msg_id=%d (чат '%s'): %s",
+                                tid, chat_title, msg.get("content", "")[:100]
+                            )
+
+                # Итоговая суммаризация (общая по всем чатам)
+                if llm_summaries:
+                    # Формируем текст для общей суммаризации
+                    summary_text_for_llm = ""
+                    for msg in new_msgs:
+                        chat_title = msg.get("chat_title", "?")
+                        content = msg.get("content", "")[:200]  # Только начало
+                        summary_text_for_llm += f"[{chat_title}] {content}\n"
+
+                    summary = self.llm_client.summarize(
+                        summary_text_for_llm,
+                        system_prompt=(
+                            "Ты — ассистент для суммаризации сообщений из Telegram. "
+                            "Составь краткое резюме (1-2 абзаца) по всем сообщениям. "
+                            "Выдели самые важные темы и события."
+                        ),
+                        detail=detail
+                    )
+                    if summary is None:
+                        summary = "Суммаризация отдельных сообщений выполнена."
+
+                # 8. Fallback: для сообщений без суммари — отдельный запрос
+                missing_ids = [
+                    msg for msg in new_msgs if msg["telegram_id"] not in llm_summaries
+                ]
+                if missing_ids:
+                    logger.info(
+                        "Fallback: отправляю %d сообщений без суммари на отдельный запрос",
+                        len(missing_ids)
+                    )
+                    for msg in missing_ids:
+                        tid = msg["telegram_id"]
+                        chat_title = msg.get("chat_title", "Unknown")
+                        content = msg.get("content", "")
+                        
+                        fallback_prompt = (
+                            f"Суммаризируй это сообщение в 1-2 предложения.\n\n"
+                            f"Сообщение из '{chat_title}':\n{content}"
+                        )
+                        
+                        response = self.llm_client.summarize(
+                            fallback_prompt,
+                            detail=detail
+                        )
+                        if response:
+                            llm_summaries[tid] = response
+                            logger.info("Fallback суммари для msg_id=%d", tid)
+
+                # 10. Сохранить суммари в БД и пометить как processed
                 for msg in new_msgs:
                     tid = msg["telegram_id"]  # int
                     if tid in llm_summaries:
                         self.db.update_message_summary(tid, llm_summaries[tid])
                         logger.info("Сохранено суммари для msg_id=%d", tid)
 
-            # 9. Вычислить период
+            # 11. Вычислить период
             timestamps = [m.get("timestamp", "") for m in messages if m.get("timestamp")]
             if timestamps:
                 period_start = min(timestamps)
@@ -353,32 +412,42 @@ class Summarizer:
         return all_messages
 
     def _parse_llm_summaries(self, summary_text: str,
-                              new_messages: list[dict]) -> dict:
+                               new_messages: list[dict]) -> dict:
         """
         Парсить ответ LLM в словарь {telegram_id: summary_text}.
-        Валидирует что telegram_id — число.
+        
+        Гибкий парсинг: ищет ID и SUMMARY в любом месте строки,
+        регистронезависимо, поддерживает различные разделители.
         """
+        import re
+        
         result = {}
         lines = summary_text.strip().split('\n')
 
         for line in lines:
             line = line.strip()
-            if not line or "SUMMARY:" not in line:
+            if not line:
                 continue
 
-            parts = line.split("|")
+            # Ищем ID в любом месте строки (регистронезависимо)
+            id_match = re.search(r'ID[:\s]+(\d+)', line, re.IGNORECASE)
+            if not id_match:
+                continue
+
+            telegram_id = id_match.group(1)
+            
+            # Ищем SUMMARY в любом месте строки
             summary_part = ""
-            telegram_id = ""
+            summary_match = re.search(r'SUMMARY[:\s]+(.+?)(?:\s*\||\s*$)', line, re.IGNORECASE | re.DOTALL)
+            if summary_match:
+                summary_part = summary_match.group(1).strip()
+            else:
+                # Fallback: берём текст после ID
+                id_pos = id_match.end()
+                if id_pos < len(line):
+                    summary_part = line[id_pos:].strip().rstrip('|').strip()
 
-            for part in parts:
-                part = part.strip()
-                if part.startswith("SUMMARY:"):
-                    summary_part = part.replace("SUMMARY:", "").strip()
-                elif part.startswith("ID:"):
-                    telegram_id = part.replace("ID:", "").strip()
-
-            # Валидация telegram_id
-            if not summary_part or not telegram_id:
+            if not summary_part:
                 continue
 
             try:
